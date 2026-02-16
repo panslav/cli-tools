@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 SESS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
 LABELS_FILE="${CODEX_SESSION_LABELS_FILE:-$HOME/.local/state/codex-session/labels.tsv}"
 SUMMARIES_FILE="${CODEX_SESSION_SUMMARIES_FILE:-$HOME/.local/state/codex-session/summaries.tsv}"
@@ -27,14 +28,20 @@ Options:
   --name "TEXT"         Save/update a human-friendly name for the target session.
   --summary "TEXT"      Save/update a summary (stored as first 10 words).
   --delete              Delete the target session and any saved metadata for it.
-  -h, --help            Show this help.
+  -h, --help            Show README.md in the terminal.
 EOF
 }
 
-if [ ! -d "$SESS_DIR" ]; then
-  echo "Session directory not found: $SESS_DIR" >&2
-  exit 1
-fi
+show_readme() {
+  readme_file="$SCRIPT_DIR/README.md"
+  if [ -f "$readme_file" ]; then
+    cat "$readme_file"
+    return 0
+  fi
+  echo "README.md not found next to script: $readme_file" >&2
+  usage
+  return 1
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -69,7 +76,7 @@ while [ "$#" -gt 0 ]; do
       SESSION_ID_ARG="$1"
       ;;
     -h|--help)
-      usage
+      show_readme
       exit 0
       ;;
     -*)
@@ -89,6 +96,11 @@ done
 
 if [ "$MODE_DELETE" -eq 1 ] && { [ -n "$SET_NAME" ] || [ -n "$SET_SUMMARY" ]; }; then
   echo "--delete cannot be combined with --name or --summary." >&2
+  exit 1
+fi
+
+if [ ! -d "$SESS_DIR" ]; then
+  echo "Session directory not found: $SESS_DIR" >&2
   exit 1
 fi
 
@@ -213,11 +225,12 @@ remove_metadata_for_id() {
 
 delete_session_by_idx() {
   target_idx="$1"
+  target_number=$((target_idx + 1))
   target_id="${IDS[$target_idx]}"
   target_file="${SESSION_FILES[$target_idx]}"
 
   if [ -t 0 ] && [ -t 1 ]; then
-    printf 'Delete session %s? [y/N]: ' "$target_id"
+    printf 'Delete session #%s? [y/N]: ' "$target_number"
     read -r confirm
     case "$(printf '%s' "$confirm" | tr '[:upper:]' '[:lower:]')" in
       y|yes) ;;
@@ -250,8 +263,47 @@ delete_session_by_idx() {
     cleanup_dir="$(dirname "$cleanup_dir")"
   done
 
-  printf 'Deleted session: %s\n' "$target_id"
+  printf 'Deleted session #%s\n' "$target_number"
   return 0
+}
+
+edit_session_by_idx() {
+  target_idx="$1"
+  target_number=$((target_idx + 1))
+  edit_kind="$2"
+  preset_value="${3-}"
+  target_id="${IDS[$target_idx]}"
+
+  case "$edit_kind" in
+    name)
+      if [ -n "$preset_value" ]; then
+        new_name="$preset_value"
+      else
+        printf 'Enter new name for session #%s: ' "$target_number"
+        read -r new_name
+      fi
+      save_name_for_id "$target_id" "$new_name"
+      printf 'Saved session name for #%s -> %s\n' "$target_number" "$(normalize_name "$new_name")"
+      ;;
+    summary)
+      if [ -n "$preset_value" ]; then
+        new_summary="$preset_value"
+      else
+        printf 'Enter new summary for session #%s: ' "$target_number"
+        read -r new_summary
+      fi
+      save_summary_for_id "$target_id" "$new_summary"
+      if [ "$LAST_SUMMARY_TRUNCATED" -eq 1 ]; then
+        printf 'Saved session summary (truncated to 10 words) for #%s -> [%s]\n' "$target_number" "$(normalize_summary "$new_summary")"
+      else
+        printf 'Saved session summary for #%s -> [%s]\n' "$target_number" "$(normalize_summary "$new_summary")"
+      fi
+      ;;
+    *)
+      echo "Unknown edit type: $edit_kind" >&2
+      exit 1
+      ;;
+  esac
 }
 
 select_target_idx() {
@@ -320,80 +372,85 @@ auto_summary_for_file() {
   printf '%s\n' "$summary"
 }
 
-FILES=()
-while IFS= read -r file; do
-  FILES+=("$file")
-done < <(find "$SESS_DIR" -type f -name '*.jsonl' | sort -r)
+load_sessions() {
+  FILES=()
+  while IFS= read -r file; do
+    FILES+=("$file")
+  done < <(find "$SESS_DIR" -type f -name '*.jsonl' | sort -r)
 
-if [ "${#FILES[@]}" -eq 0 ]; then
-  echo "No sessions found." >&2
-  exit 1
-fi
-
-IDS=()
-DISPLAYS=()
-SESSION_FILES=()
-for file in "${FILES[@]}"; do
-  sid="$(extract_session_id "$file")"
-  if [ -z "$sid" ]; then
-    continue
+  if [ "${#FILES[@]}" -eq 0 ]; then
+    echo "No sessions found." >&2
+    return 1
   fi
 
-  if [ -n "$SESSION_ID_ARG" ] && [ "$sid" != "$SESSION_ID_ARG" ]; then
-    continue
-  fi
-
-  dt="$(format_label "$file")"
-  saved_name="$(name_for_id "$sid")"
-  name_text="$saved_name"
-  if [ -z "$name_text" ]; then
-    name_text="Unnamed"
-  fi
-  saved_summary="$(summary_for_id "$sid")"
-  if [ -n "$saved_summary" ]; then
-    summary_text="$(normalize_summary "$saved_summary")"
-  else
-    summary_text="$(auto_summary_for_file "$file" "$saved_name")"
-  fi
-  if [ -z "$summary_text" ]; then
-    summary_text="Summary unavailable for this session"
-  fi
-  display="$dt   $name_text [$summary_text] ($sid)"
-
-  if [ -n "$FILTER" ]; then
-    FILTER_LC="$(printf '%s' "$FILTER" | tr '[:upper:]' '[:lower:]')"
-    searchable="$(printf '%s %s %s %s %s' "$file" "$sid" "$dt" "$saved_name" "$summary_text" | tr '[:upper:]' '[:lower:]')"
-    if ! printf '%s' "$searchable" | grep -Fq "$FILTER_LC"; then
+  IDS=()
+  DISPLAYS=()
+  SESSION_FILES=()
+  for file in "${FILES[@]}"; do
+    sid="$(extract_session_id "$file")"
+    if [ -z "$sid" ]; then
       continue
     fi
-  fi
 
-  IDS+=("$sid")
-  DISPLAYS+=("$display")
-  SESSION_FILES+=("$file")
-done
+    if [ -n "$SESSION_ID_ARG" ] && [ "$sid" != "$SESSION_ID_ARG" ]; then
+      continue
+    fi
 
-if [ "${#IDS[@]}" -eq 0 ]; then
-  if [ -n "$SESSION_ID_ARG" ]; then
-    echo "No matching session found for id: $SESSION_ID_ARG" >&2
-  else
-    echo "No matching sessions found." >&2
+    dt="$(format_label "$file")"
+    saved_name="$(name_for_id "$sid")"
+    name_text="$saved_name"
+    if [ -z "$name_text" ]; then
+      name_text="Unnamed"
+    fi
+    saved_summary="$(summary_for_id "$sid")"
+    if [ -n "$saved_summary" ]; then
+      summary_text="$(normalize_summary "$saved_summary")"
+    else
+      summary_text="$(auto_summary_for_file "$file" "$saved_name")"
+    fi
+    if [ -z "$summary_text" ]; then
+      summary_text="Summary unavailable for this session"
+    fi
+    display="$dt   $name_text [$summary_text]"
+
+    if [ -n "$FILTER" ]; then
+      FILTER_LC="$(printf '%s' "$FILTER" | tr '[:upper:]' '[:lower:]')"
+      searchable="$(printf '%s %s %s %s %s' "$file" "$sid" "$dt" "$saved_name" "$summary_text" | tr '[:upper:]' '[:lower:]')"
+      if ! printf '%s' "$searchable" | grep -Fq "$FILTER_LC"; then
+        continue
+      fi
+    fi
+
+    IDS+=("$sid")
+    DISPLAYS+=("$display")
+    SESSION_FILES+=("$file")
+  done
+
+  if [ "${#IDS[@]}" -eq 0 ]; then
+    if [ -n "$SESSION_ID_ARG" ]; then
+      echo "No matching session found for id: $SESSION_ID_ARG" >&2
+    else
+      echo "No matching sessions found." >&2
+    fi
+    return 1
   fi
-  exit 1
-fi
+}
+
+load_sessions || exit 1
 
 if [ -n "$SET_NAME" ] || [ -n "$SET_SUMMARY" ]; then
   target_idx="$(select_target_idx "update")"
+  target_number=$((target_idx + 1))
   if [ -n "$SET_NAME" ]; then
     save_name_for_id "${IDS[$target_idx]}" "$SET_NAME"
-    printf 'Saved session name: %s -> %s\n' "${IDS[$target_idx]}" "$(normalize_name "$SET_NAME")"
+    printf 'Saved session name for #%s -> %s\n' "$target_number" "$(normalize_name "$SET_NAME")"
   fi
   if [ -n "$SET_SUMMARY" ]; then
     save_summary_for_id "${IDS[$target_idx]}" "$SET_SUMMARY"
     if [ "$LAST_SUMMARY_TRUNCATED" -eq 1 ]; then
-      printf 'Saved session summary (truncated to 10 words): %s -> [%s]\n' "${IDS[$target_idx]}" "$(normalize_summary "$SET_SUMMARY")"
+      printf 'Saved session summary (truncated to 10 words) for #%s -> [%s]\n' "$target_number" "$(normalize_summary "$SET_SUMMARY")"
     else
-      printf 'Saved session summary: %s -> [%s]\n' "${IDS[$target_idx]}" "$(normalize_summary "$SET_SUMMARY")"
+      printf 'Saved session summary for #%s -> [%s]\n' "$target_number" "$(normalize_summary "$SET_SUMMARY")"
     fi
   fi
   exit 0
@@ -420,46 +477,71 @@ if command -v fzf >/dev/null 2>&1 && [ -t 0 ] && [ -t 1 ]; then
   [ -n "$CHOICE" ] || exit 0
   SESSION_ID="${CHOICE#*$'\t'}"
 else
-  i=1
-  for label in "${DISPLAYS[@]}"; do
-    printf '%2d) %s\n' "$i" "$label"
-    i=$((i + 1))
-  done
-  printf ' 0) Exit\n'
-  printf 'Select session number (or -N to delete): '
-  read -r idx
-  case "$idx" in
-    '')
-      echo "Invalid number." >&2
-      exit 1
-      ;;
-  esac
-  case "$idx" in
-    0)
+  while :; do
+    i=1
+    for label in "${DISPLAYS[@]}"; do
+      printf '%2d) %s\n' "$i" "$label"
+      i=$((i + 1))
+    done
+    printf ' 0) Exit\n'
+    printf 'Select session: N=resume, N delete, N name: <text>, N summary: <text>: '
+    read -r idx
+    idx="$(printf '%s' "$idx" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    case "$idx" in
+      '')
+        echo "Invalid number." >&2
+        continue
+        ;;
+    esac
+
+    if [ "$idx" = "0" ]; then
       exit 0
-      ;;
-    -[0-9]*)
-      delete_num="${idx#-}"
-      if [ -z "$delete_num" ] || [ "$delete_num" -lt 1 ] || [ "$delete_num" -gt "${#IDS[@]}" ]; then
+    fi
+
+    if [[ "$idx" =~ ^([0-9]+)[[:space:]]+([Nn][Aa][Mm][Ee]|[Ss][Uu][Mm][Mm][Aa][Rr][Yy]):[[:space:]]*(.*)$ ]]; then
+      edit_num="${BASH_REMATCH[1]}"
+      edit_cmd="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
+      edit_value="${BASH_REMATCH[3]}"
+      if [ "$edit_num" -lt 1 ] || [ "$edit_num" -gt "${#IDS[@]}" ]; then
         echo "Selection out of range." >&2
-        exit 1
+        continue
+      fi
+      edit_idx=$((edit_num - 1))
+      case "$edit_cmd" in
+        name)
+          edit_session_by_idx "$edit_idx" "name" "$edit_value" || true
+          ;;
+        summary)
+          edit_session_by_idx "$edit_idx" "summary" "$edit_value" || true
+          ;;
+      esac
+      load_sessions || exit 1
+      continue
+    fi
+
+    if [[ "$idx" =~ ^([0-9]+)[[:space:]]+[Dd][Ee][Ll][Ee][Tt][Ee]$ ]]; then
+      delete_num="${BASH_REMATCH[1]}"
+      if [ "$delete_num" -lt 1 ] || [ "$delete_num" -gt "${#IDS[@]}" ]; then
+        echo "Selection out of range." >&2
+        continue
       fi
       delete_idx=$((delete_num - 1))
-      delete_session_by_idx "$delete_idx" || exit 0
-      exit 0
-      ;;
-    [0-9]*)
+      delete_session_by_idx "$delete_idx" || true
+      load_sessions || exit 1
+      continue
+    fi
+
+    if [[ "$idx" =~ ^[0-9]+$ ]]; then
       if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#IDS[@]}" ]; then
         echo "Selection out of range." >&2
-        exit 1
+        continue
       fi
       SESSION_ID="${IDS[$((idx - 1))]}"
-      ;;
-    *)
-      echo "Invalid number." >&2
-      exit 1
-      ;;
-  esac
+      break
+    fi
+
+    echo "Invalid number." >&2
+  done
 fi
 
 if [ -z "$SESSION_ID" ]; then
