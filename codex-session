@@ -5,6 +5,13 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 SESS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
 LABELS_FILE="${CODEX_SESSION_LABELS_FILE:-$HOME/.local/state/codex-session/labels.tsv}"
 SUMMARIES_FILE="${CODEX_SESSION_SUMMARIES_FILE:-$HOME/.local/state/codex-session/summaries.tsv}"
+DEFAULT_VAULT_DIR="/Users/evgeny/Library/CloudStorage/OneDrive-Personal/Documents/Рабочее/Obsidian-pro/Professional Vault"
+VAULT_DIR="${CODEX_SESSION_VAULT_DIR:-$DEFAULT_VAULT_DIR}"
+VAULT_CODEX_SESSION_DIR="${CODEX_SESSION_VAULT_NOTE_DIR:-$VAULT_DIR/Projects/AI/Codex/codex-session}"
+SESSIONS_LOG_FILE="${CODEX_SESSION_LOG_FILE:-$VAULT_CODEX_SESSION_DIR/Sessions.md}"
+SESSION_CONTEXT_INDEX_FILE="${CODEX_SESSION_CONTEXT_INDEX_FILE:-$VAULT_CODEX_SESSION_DIR/session-context-index.md}"
+SESSION_CONTEXTS_DIR="${CODEX_SESSION_CONTEXTS_DIR:-$VAULT_CODEX_SESSION_DIR/session-contexts}"
+LEGACY_SESSION_CONTEXT_FILE="${CODEX_SESSION_LEGACY_CONTEXT_FILE:-$VAULT_DIR/Projects/AI/Codex/Session Context.md}"
 MODE_LATEST=0
 SET_NAME=""
 SET_SUMMARY=""
@@ -41,6 +48,247 @@ show_readme() {
   echo "README.md not found next to script: $readme_file" >&2
   usage
   return 1
+}
+
+normalize_log_field() {
+  printf '%s' "${1-}" | tr '\t\r\n' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+ensure_session_context_index() {
+  mkdir -p "$SESSION_CONTEXTS_DIR" "$(dirname "$SESSION_CONTEXT_INDEX_FILE")"
+
+  if [ ! -f "$SESSION_CONTEXT_INDEX_FILE" ] && [ -f "$LEGACY_SESSION_CONTEXT_FILE" ]; then
+    mv "$LEGACY_SESSION_CONTEXT_FILE" "$SESSION_CONTEXT_INDEX_FILE"
+  fi
+
+  if [ ! -f "$SESSION_CONTEXT_INDEX_FILE" ]; then
+    cat > "$SESSION_CONTEXT_INDEX_FILE" <<'EOF'
+# Session Context Index
+
+## Session Context Notes
+EOF
+  fi
+
+  if ! grep -Fqx "## Session Context Notes" "$SESSION_CONTEXT_INDEX_FILE"; then
+    printf '\n## Session Context Notes\n' >> "$SESSION_CONTEXT_INDEX_FILE"
+  fi
+}
+
+upsert_session_context_link() {
+  sid="$1"
+  name="$2"
+  description="$3"
+  ensure_session_context_index
+
+  normalized_name="$(normalize_log_field "$name")"
+  normalized_description="$(normalize_log_field "$description")"
+  if [ -z "$normalized_name" ]; then
+    normalized_name="Unnamed"
+  fi
+  if [ -z "$normalized_description" ]; then
+    normalized_description="No description"
+  fi
+
+  rel_note_path="session-contexts/${sid}.md"
+  if grep -Fq "[[${rel_note_path}" "$SESSION_CONTEXT_INDEX_FILE"; then
+    return 0
+  fi
+
+  entry="* [[${rel_note_path}|${normalized_name}]] - ${normalized_description}"
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-context-index.XXXXXX")"
+  awk -v heading="## Session Context Notes" -v entry="$entry" '
+    BEGIN { inserted = 0 }
+    {
+      print
+      if ($0 == heading && inserted == 0) {
+        print entry
+        inserted = 1
+      }
+    }
+    END {
+      if (inserted == 0) {
+        print ""
+        print heading
+        print entry
+      }
+    }
+  ' "$SESSION_CONTEXT_INDEX_FILE" > "$tmp_file"
+  mv "$tmp_file" "$SESSION_CONTEXT_INDEX_FILE"
+}
+
+append_session_context_entry() {
+  sid="$1"
+  name="$2"
+  description="$3"
+  resume_target="$4"
+  ensure_session_context_index
+
+  note_path="$SESSION_CONTEXTS_DIR/${sid}.md"
+  [ -f "$note_path" ] || : > "$note_path"
+
+  normalized_name="$(normalize_log_field "$name")"
+  normalized_description="$(normalize_log_field "$description")"
+  if [ -z "$normalized_name" ]; then
+    normalized_name="Unnamed"
+  fi
+  if [ -z "$normalized_description" ]; then
+    normalized_description="No description"
+  fi
+
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  {
+    if [ -s "$note_path" ]; then
+      printf '\n'
+    fi
+    printf '# %s\n' "$timestamp"
+    printf 'Session ID: %s\n\n' "$sid"
+    printf '## Summary\n'
+    printf '* Name: %s\n' "$normalized_name"
+    printf '* Description: %s\n\n' "$normalized_description"
+    printf '## Session Context\n'
+    printf '* Resume Target: `%s`\n' "$resume_target"
+    printf '* Vault: `%s`\n' "$VAULT_DIR"
+  } >> "$note_path"
+
+  upsert_session_context_link "$sid" "$normalized_name" "$normalized_description"
+}
+
+normalize_sessions_log_file() {
+  if [ ! -f "$SESSIONS_LOG_FILE" ]; then
+    return 0
+  fi
+
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-log-normalize.XXXXXX")"
+  awk '
+    /^# Sessions[[:space:]]*$/ { next }
+    /^## [0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]*$/ {
+      sub(/^## /, "# ")
+      print
+      next
+    }
+    { print }
+  ' "$SESSIONS_LOG_FILE" > "$tmp_file"
+
+  trimmed_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-log-trim.XXXXXX")"
+  sed -E '/./,$!d' "$tmp_file" > "$trimmed_file"
+  mv "$trimmed_file" "$SESSIONS_LOG_FILE"
+  rm -f "$tmp_file"
+}
+
+mark_latest_log_status_failed() {
+  if [ ! -f "$SESSIONS_LOG_FILE" ]; then
+    return 0
+  fi
+
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-log-failmark.XXXXXX")"
+  awk '
+    BEGIN { top_header_seen = 0; updated = 0 }
+    /^# / && top_header_seen == 0 {
+      top_header_seen = 1
+      print
+      next
+    }
+    top_header_seen == 1 && updated == 0 && /^\+ / {
+      sub(/^\+ /, "X ")
+      updated = 1
+      print
+      next
+    }
+    { print }
+  ' "$SESSIONS_LOG_FILE" > "$tmp_file"
+  mv "$tmp_file" "$SESSIONS_LOG_FILE"
+}
+
+append_session_log() {
+  status="${1-}"
+  name="${2-}"
+  description="${3-}"
+  log_date="$(date '+%Y-%m-%d')"
+  log_time="$(date '+%H:%M:%S')"
+  log_header="# $log_date"
+  normalized_name="$(normalize_log_field "$name")"
+  normalized_description="$(normalize_log_field "$description")"
+
+  if [ -z "$normalized_name" ]; then
+    normalized_name="Unnamed"
+  fi
+  if [ -z "$normalized_description" ]; then
+    normalized_description="No description"
+  fi
+
+  mkdir -p "$(dirname "$SESSIONS_LOG_FILE")"
+  [ -f "$SESSIONS_LOG_FILE" ] || : > "$SESSIONS_LOG_FILE"
+  normalize_sessions_log_file
+
+  target_section_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-log-target.XXXXXX")"
+  rest_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-log-rest.XXXXXX")"
+  out_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-log-out.XXXXXX")"
+
+  awk -v hdr="$log_header" '
+    $0 == hdr { in_target = 1; next }
+    /^# / && in_target == 1 { exit }
+    in_target == 1 { print }
+  ' "$SESSIONS_LOG_FILE" > "$target_section_file"
+
+  awk -v hdr="$log_header" '
+    $0 == hdr { skip_target = 1; next }
+    /^# / && skip_target == 1 { skip_target = 0 }
+    skip_target == 0 { print }
+  ' "$SESSIONS_LOG_FILE" > "$rest_file"
+
+  rest_trimmed_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-log-rest-trim.XXXXXX")"
+  sed -E '/./,$!d' "$rest_file" > "$rest_trimmed_file"
+  mv "$rest_trimmed_file" "$rest_file"
+
+  {
+    printf '%s\n' "$log_header"
+    printf '%s %s %s %s %s.\n' "$status" "$log_date" "$log_time" "$normalized_name" "$normalized_description"
+    if [ -s "$target_section_file" ]; then
+      cat "$target_section_file"
+    fi
+    if [ -s "$rest_file" ]; then
+      printf '\n'
+      cat "$rest_file"
+    fi
+  } > "$out_file"
+
+  mv "$out_file" "$SESSIONS_LOG_FILE"
+  rm -f "$target_section_file" "$rest_file"
+}
+
+run_codex_resume() {
+  if [ "${CODEX_SESSION_DISABLE_VAULT:-0}" = "1" ]; then
+    codex resume "$@"
+    return $?
+  fi
+
+  if [ -d "$VAULT_DIR" ]; then
+    (
+      cd "$VAULT_DIR"
+      codex resume "$@"
+    )
+    return $?
+  fi
+
+  echo "Warning: configured vault path not found: $VAULT_DIR" >&2
+  codex resume "$@"
+}
+
+resume_codex_with_log() {
+  session_id="${1-}"
+  resume_name="${2-}"
+  resume_description="${3-}"
+  resume_target="${4-}"
+  shift 4
+
+  append_session_context_entry "$session_id" "$resume_name" "$resume_description" "$resume_target" || true
+  append_session_log "+" "$resume_name" "$resume_description" || true
+  if run_codex_resume "$@"; then
+    return 0
+  fi
+  rc=$?
+  mark_latest_log_status_failed || true
+  return "$rc"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -386,6 +634,8 @@ load_sessions() {
   IDS=()
   DISPLAYS=()
   SESSION_FILES=()
+  SESSION_NAMES=()
+  SESSION_SUMMARIES=()
   for file in "${FILES[@]}"; do
     sid="$(extract_session_id "$file")"
     if [ -z "$sid" ]; then
@@ -424,6 +674,8 @@ load_sessions() {
     IDS+=("$sid")
     DISPLAYS+=("$display")
     SESSION_FILES+=("$file")
+    SESSION_NAMES+=("$name_text")
+    SESSION_SUMMARIES+=("$summary_text")
   done
 
   if [ "${#IDS[@]}" -eq 0 ]; then
@@ -463,7 +715,11 @@ if [ "$MODE_DELETE" -eq 1 ]; then
 fi
 
 if [ "$MODE_LATEST" -eq 1 ] && [ -z "$FILTER" ] && [ -z "$SESSION_ID_ARG" ]; then
-  exec codex resume --last
+  latest_id="${IDS[0]}"
+  latest_name="${SESSION_NAMES[0]:-Unnamed}"
+  latest_summary="${SESSION_SUMMARIES[0]:-Summary unavailable for this session}"
+  resume_codex_with_log "$latest_id" "$latest_name" "$latest_summary" "--last" --last
+  exit $?
 fi
 
 if command -v fzf >/dev/null 2>&1 && [ -t 0 ] && [ -t 1 ]; then
@@ -549,4 +805,14 @@ if [ -z "$SESSION_ID" ]; then
   exit 1
 fi
 
-exec codex resume "$SESSION_ID"
+selected_idx=0
+for sid in "${IDS[@]}"; do
+  if [ "$sid" = "$SESSION_ID" ]; then
+    break
+  fi
+  selected_idx=$((selected_idx + 1))
+done
+
+selected_name="${SESSION_NAMES[$selected_idx]:-Unnamed}"
+selected_summary="${SESSION_SUMMARIES[$selected_idx]:-Summary unavailable for this session}"
+resume_codex_with_log "$SESSION_ID" "$selected_name" "$selected_summary" "$SESSION_ID" "$SESSION_ID"
