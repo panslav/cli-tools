@@ -2,19 +2,84 @@
 set -euo pipefail
 
 SESS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
+LABELS_FILE="${CODEX_SESSION_LABELS_FILE:-$HOME/.local/state/codex-session/labels.tsv}"
+SUMMARIES_FILE="${CODEX_SESSION_SUMMARIES_FILE:-$HOME/.local/state/codex-session/summaries.tsv}"
 MODE_LATEST=0
+SET_NAME=""
+SET_SUMMARY=""
+SESSION_ID_ARG=""
+FILTER=""
+LAST_SUMMARY_TRUNCATED=0
 
-if [ "${1:-}" = "--latest" ]; then
-  MODE_LATEST=1
-  shift
-fi
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-session [--latest] [--id SESSION_ID] [FILTER]
+  codex-session --name "Session Name" [--latest|--id SESSION_ID|FILTER]
+  codex-session --summary "Up to ten words" [--latest|--id SESSION_ID|FILTER]
+  codex-session --name "Session Name" --summary "Up to ten words" [target]
 
-FILTER="${1:-}"
+Options:
+  --latest              Target the most recent session.
+  --id SESSION_ID       Target a specific session id.
+  --name "TEXT"         Save/update a human-friendly name for the target session.
+  --summary "TEXT"      Save/update a summary (stored as first 10 words).
+  -h, --help            Show this help.
+EOF
+}
 
 if [ ! -d "$SESS_DIR" ]; then
   echo "Session directory not found: $SESS_DIR" >&2
   exit 1
 fi
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --latest)
+      MODE_LATEST=1
+      ;;
+    --name)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "Missing value for --name" >&2
+        exit 1
+      fi
+      SET_NAME="$1"
+      ;;
+    --summary)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "Missing value for --summary" >&2
+        exit 1
+      fi
+      SET_SUMMARY="$1"
+      ;;
+    --id)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "Missing value for --id" >&2
+        exit 1
+      fi
+      SESSION_ID_ARG="$1"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      if [ -n "$FILTER" ]; then
+        echo "Only one FILTER argument is supported." >&2
+        exit 1
+      fi
+      FILTER="$1"
+      ;;
+  esac
+  shift
+done
 
 format_label() {
   file="$1"
@@ -38,52 +103,247 @@ extract_session_id() {
   printf '%s\n' "$id"
 }
 
+normalize_name() {
+  printf '%s' "$1" | tr '\t\r\n' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+sanitize_summary() {
+  cleaned="$(printf '%s' "$1" | tr '\t\r\n' '   ' | sed -E 's/[^[:alnum:] ]+/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  printf '%s\n' "$cleaned"
+}
+
+normalize_summary() {
+  cleaned="$(sanitize_summary "$1")"
+  printf '%s\n' "$cleaned" | awk '{
+    for (i = 1; i <= NF && i <= 10; i++) {
+      printf "%s%s", (i == 1 ? "" : " "), $i
+    }
+    if (NF > 0) { printf "\n" }
+  }'
+}
+
+name_for_id() {
+  sid="$1"
+  if [ ! -f "$LABELS_FILE" ]; then
+    return 0
+  fi
+  line="$(grep -F "${sid}"$'\t' "$LABELS_FILE" 2>/dev/null | tail -n 1 || true)"
+  if [ -n "$line" ]; then
+    printf '%s\n' "${line#*$'\t'}"
+  fi
+}
+
+summary_for_id() {
+  sid="$1"
+  if [ ! -f "$SUMMARIES_FILE" ]; then
+    return 0
+  fi
+  line="$(grep -F "${sid}"$'\t' "$SUMMARIES_FILE" 2>/dev/null | tail -n 1 || true)"
+  if [ -n "$line" ]; then
+    printf '%s\n' "${line#*$'\t'}"
+  fi
+}
+
+save_name_for_id() {
+  sid="$1"
+  raw_name="$2"
+  cleaned="$(normalize_name "$raw_name")"
+  if [ -z "$cleaned" ]; then
+    echo "Name cannot be empty." >&2
+    exit 1
+  fi
+
+  labels_dir="$(dirname "$LABELS_FILE")"
+  mkdir -p "$labels_dir"
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-labels.XXXXXX")"
+  if [ -f "$LABELS_FILE" ]; then
+    awk -F '\t' -v sid="$sid" '$1 != sid' "$LABELS_FILE" > "$tmp_file"
+  fi
+  printf '%s\t%s\n' "$sid" "$cleaned" >> "$tmp_file"
+  mv "$tmp_file" "$LABELS_FILE"
+}
+
+save_summary_for_id() {
+  sid="$1"
+  raw_summary="$2"
+  sanitized="$(sanitize_summary "$raw_summary")"
+  words="$(printf '%s\n' "$sanitized" | awk '{print NF}')"
+  cleaned="$(normalize_summary "$raw_summary")"
+  if [ -z "$cleaned" ]; then
+    echo "Summary cannot be empty." >&2
+    exit 1
+  fi
+  LAST_SUMMARY_TRUNCATED=0
+  if [ "${words:-0}" -gt 10 ]; then
+    LAST_SUMMARY_TRUNCATED=1
+  fi
+
+  summaries_dir="$(dirname "$SUMMARIES_FILE")"
+  mkdir -p "$summaries_dir"
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-summaries.XXXXXX")"
+  if [ -f "$SUMMARIES_FILE" ]; then
+    awk -F '\t' -v sid="$sid" '$1 != sid' "$SUMMARIES_FILE" > "$tmp_file"
+  fi
+  printf '%s\t%s\n' "$sid" "$cleaned" >> "$tmp_file"
+  mv "$tmp_file" "$SUMMARIES_FILE"
+}
+
+auto_summary_for_file() {
+  file="$1"
+  fallback_name="$2"
+  raw="$(sed -nE 's/.*"type":"user_message","message":"([^"]*)".*/\1/p' "$file" | tail -n 1)"
+  summary="$(normalize_summary "$raw")"
+  if [ -z "$summary" ] && [ -n "$fallback_name" ]; then
+    summary="$(normalize_summary "$fallback_name")"
+  fi
+  if [ -z "$summary" ]; then
+    summary="Summary unavailable for this session"
+  fi
+  printf '%s\n' "$summary"
+}
+
 FILES=()
 while IFS= read -r file; do
   FILES+=("$file")
 done < <(find "$SESS_DIR" -type f -name '*.jsonl' | sort -r)
 
-if [ -n "$FILTER" ]; then
-  FILTER_LC="$(printf '%s' "$FILTER" | tr '[:upper:]' '[:lower:]')"
-  FILTERED=()
-  for file in "${FILES[@]}"; do
-    if printf '%s' "$file" | tr '[:upper:]' '[:lower:]' | grep -Fq "$FILTER_LC"; then
-      FILTERED+=("$file")
-    fi
-  done
-  FILES=("${FILTERED[@]}")
-fi
-
 if [ "${#FILES[@]}" -eq 0 ]; then
-  echo "No matching sessions found." >&2
+  echo "No sessions found." >&2
   exit 1
 fi
 
-LABELS=()
+IDS=()
+DISPLAYS=()
 for file in "${FILES[@]}"; do
-  LABELS+=("$(format_label "$file")")
+  sid="$(extract_session_id "$file")"
+  if [ -z "$sid" ]; then
+    continue
+  fi
+
+  if [ -n "$SESSION_ID_ARG" ] && [ "$sid" != "$SESSION_ID_ARG" ]; then
+    continue
+  fi
+
+  dt="$(format_label "$file")"
+  saved_name="$(name_for_id "$sid")"
+  name_text="$saved_name"
+  if [ -z "$name_text" ]; then
+    name_text="Unnamed"
+  fi
+  saved_summary="$(summary_for_id "$sid")"
+  if [ -n "$saved_summary" ]; then
+    summary_text="$(normalize_summary "$saved_summary")"
+  else
+    summary_text="$(auto_summary_for_file "$file" "$saved_name")"
+  fi
+  if [ -z "$summary_text" ]; then
+    summary_text="Summary unavailable for this session"
+  fi
+  display="$dt   $name_text $sid   [$summary_text]"
+
+  if [ -n "$FILTER" ]; then
+    FILTER_LC="$(printf '%s' "$FILTER" | tr '[:upper:]' '[:lower:]')"
+    searchable="$(printf '%s %s %s %s %s' "$file" "$sid" "$dt" "$saved_name" "$summary_text" | tr '[:upper:]' '[:lower:]')"
+    if ! printf '%s' "$searchable" | grep -Fq "$FILTER_LC"; then
+      continue
+    fi
+  fi
+
+  IDS+=("$sid")
+  DISPLAYS+=("$display")
 done
 
-if [ "$MODE_LATEST" -eq 1 ] && [ -z "$FILTER" ]; then
+if [ "${#IDS[@]}" -eq 0 ]; then
+  if [ -n "$SESSION_ID_ARG" ]; then
+    echo "No matching session found for id: $SESSION_ID_ARG" >&2
+  else
+    echo "No matching sessions found." >&2
+  fi
+  exit 1
+fi
+
+if [ -n "$SET_NAME" ] || [ -n "$SET_SUMMARY" ]; then
+  if [ "$MODE_LATEST" -eq 1 ] || [ "${#IDS[@]}" -eq 1 ]; then
+    target_idx=0
+  else
+    if command -v fzf >/dev/null 2>&1 && [ -t 0 ] && [ -t 1 ]; then
+      OPTIONS=()
+      i=0
+      while [ "$i" -lt "${#IDS[@]}" ]; do
+        OPTIONS+=("${DISPLAYS[$i]}	${IDS[$i]}")
+        i=$((i + 1))
+      done
+      selected_line="$(printf '%s\n' "${OPTIONS[@]}" | fzf --prompt='update session> ' --height=40% --reverse --delimiter=$'\t' --with-nth=1)"
+      [ -n "$selected_line" ] || exit 0
+      selected_id="${selected_line#*$'\t'}"
+      target_idx=0
+      for sid in "${IDS[@]}"; do
+        if [ "$sid" = "$selected_id" ]; then
+          break
+        fi
+        target_idx=$((target_idx + 1))
+      done
+    else
+      i=1
+      for label in "${DISPLAYS[@]}"; do
+        printf '%2d) %s\n' "$i" "$label"
+        i=$((i + 1))
+      done
+      printf ' 0) Exit\n'
+      printf 'Select session number to update: '
+      read -r idx
+      case "$idx" in
+        ''|*[!0-9]*)
+          echo "Invalid number." >&2
+          exit 1
+          ;;
+      esac
+      if [ "$idx" -eq 0 ]; then
+        exit 0
+      fi
+      if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#IDS[@]}" ]; then
+        echo "Selection out of range." >&2
+        exit 1
+      fi
+      target_idx=$((idx - 1))
+    fi
+  fi
+  if [ -n "$SET_NAME" ]; then
+    save_name_for_id "${IDS[$target_idx]}" "$SET_NAME"
+    printf 'Saved session name: %s -> %s\n' "${IDS[$target_idx]}" "$(normalize_name "$SET_NAME")"
+  fi
+  if [ -n "$SET_SUMMARY" ]; then
+    save_summary_for_id "${IDS[$target_idx]}" "$SET_SUMMARY"
+    if [ "$LAST_SUMMARY_TRUNCATED" -eq 1 ]; then
+      printf 'Saved session summary (truncated to 10 words): %s -> [%s]\n' "${IDS[$target_idx]}" "$(normalize_summary "$SET_SUMMARY")"
+    else
+      printf 'Saved session summary: %s -> [%s]\n' "${IDS[$target_idx]}" "$(normalize_summary "$SET_SUMMARY")"
+    fi
+  fi
+  exit 0
+fi
+
+if [ "$MODE_LATEST" -eq 1 ] && [ -z "$FILTER" ] && [ -z "$SESSION_ID_ARG" ]; then
   exec codex resume --last
 fi
 
 if command -v fzf >/dev/null 2>&1 && [ -t 0 ] && [ -t 1 ]; then
   OPTIONS=()
   i=0
-  while [ "$i" -lt "${#FILES[@]}" ]; do
-    OPTIONS+=("${LABELS[$i]}	${FILES[$i]}")
+  while [ "$i" -lt "${#IDS[@]}" ]; do
+    OPTIONS+=("${DISPLAYS[$i]}	${IDS[$i]}")
     i=$((i + 1))
   done
   CHOICE="$(printf '%s\n' "${OPTIONS[@]}" | fzf --prompt='codex session> ' --height=40% --reverse --delimiter=$'\t' --with-nth=1)"
   [ -n "$CHOICE" ] || exit 0
-  CHOICE="${CHOICE#*$'\t'}"
+  SESSION_ID="${CHOICE#*$'\t'}"
 else
   i=1
-  for label in "${LABELS[@]}"; do
+  for label in "${DISPLAYS[@]}"; do
     printf '%2d) %s\n' "$i" "$label"
     i=$((i + 1))
   done
+  printf ' 0) Exit\n'
   printf 'Select session number: '
   read -r idx
   case "$idx" in
@@ -92,16 +352,18 @@ else
       exit 1
       ;;
   esac
-  if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#FILES[@]}" ]; then
+  if [ "$idx" -eq 0 ]; then
+    exit 0
+  fi
+  if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#IDS[@]}" ]; then
     echo "Selection out of range." >&2
     exit 1
   fi
-  CHOICE="${FILES[$((idx - 1))]}"
+  SESSION_ID="${IDS[$((idx - 1))]}"
 fi
 
-SESSION_ID="$(extract_session_id "$CHOICE")"
 if [ -z "$SESSION_ID" ]; then
-  echo "Could not extract session id from: $CHOICE" >&2
+  echo "Could not resolve a session id." >&2
   exit 1
 fi
 
