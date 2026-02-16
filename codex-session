@@ -7,6 +7,7 @@ SUMMARIES_FILE="${CODEX_SESSION_SUMMARIES_FILE:-$HOME/.local/state/codex-session
 MODE_LATEST=0
 SET_NAME=""
 SET_SUMMARY=""
+MODE_DELETE=0
 SESSION_ID_ARG=""
 FILTER=""
 LAST_SUMMARY_TRUNCATED=0
@@ -17,6 +18,7 @@ Usage:
   codex-session [--latest] [--id SESSION_ID] [FILTER]
   codex-session --name "Session Name" [--latest|--id SESSION_ID|FILTER]
   codex-session --summary "Up to ten words" [--latest|--id SESSION_ID|FILTER]
+  codex-session --delete [--latest|--id SESSION_ID|FILTER]
   codex-session --name "Session Name" --summary "Up to ten words" [target]
 
 Options:
@@ -24,6 +26,7 @@ Options:
   --id SESSION_ID       Target a specific session id.
   --name "TEXT"         Save/update a human-friendly name for the target session.
   --summary "TEXT"      Save/update a summary (stored as first 10 words).
+  --delete              Delete the target session and any saved metadata for it.
   -h, --help            Show this help.
 EOF
 }
@@ -54,6 +57,9 @@ while [ "$#" -gt 0 ]; do
       fi
       SET_SUMMARY="$1"
       ;;
+    --delete)
+      MODE_DELETE=1
+      ;;
     --id)
       shift
       if [ "$#" -eq 0 ]; then
@@ -80,6 +86,11 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$MODE_DELETE" -eq 1 ] && { [ -n "$SET_NAME" ] || [ -n "$SET_SUMMARY" ]; }; then
+  echo "--delete cannot be combined with --name or --summary." >&2
+  exit 1
+fi
 
 format_label() {
   file="$1"
@@ -188,6 +199,113 @@ save_summary_for_id() {
   mv "$tmp_file" "$SUMMARIES_FILE"
 }
 
+remove_metadata_for_id() {
+  sid="$1"
+  for target_file in "$LABELS_FILE" "$SUMMARIES_FILE"; do
+    if [ ! -f "$target_file" ]; then
+      continue
+    fi
+    tmp_file="$(mktemp "${TMPDIR:-/tmp}/codex-session-meta.XXXXXX")"
+    awk -F '\t' -v sid="$sid" '$1 != sid' "$target_file" > "$tmp_file"
+    mv "$tmp_file" "$target_file"
+  done
+}
+
+delete_session_by_idx() {
+  target_idx="$1"
+  target_id="${IDS[$target_idx]}"
+  target_file="${SESSION_FILES[$target_idx]}"
+
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf 'Delete session %s? [y/N]: ' "$target_id"
+    read -r confirm
+    case "$(printf '%s' "$confirm" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) ;;
+      *)
+        echo "Delete cancelled."
+        return 1
+        ;;
+    esac
+  fi
+
+  case "$target_file" in
+    "$SESS_DIR"/*) ;;
+    *)
+      echo "Refusing to delete file outside session directory: $target_file" >&2
+      exit 1
+      ;;
+  esac
+
+  if [ ! -f "$target_file" ]; then
+    echo "Session file not found: $target_file" >&2
+    exit 1
+  fi
+
+  rm -f "$target_file"
+  remove_metadata_for_id "$target_id"
+
+  cleanup_dir="$(dirname "$target_file")"
+  while [ "$cleanup_dir" != "$SESS_DIR" ]; do
+    rmdir "$cleanup_dir" 2>/dev/null || break
+    cleanup_dir="$(dirname "$cleanup_dir")"
+  done
+
+  printf 'Deleted session: %s\n' "$target_id"
+  return 0
+}
+
+select_target_idx() {
+  action="$1"
+  if [ "$MODE_LATEST" -eq 1 ] || [ "${#IDS[@]}" -eq 1 ]; then
+    printf '0\n'
+    return 0
+  fi
+
+  if command -v fzf >/dev/null 2>&1 && [ -t 0 ] && [ -t 1 ]; then
+    OPTIONS=()
+    i=0
+    while [ "$i" -lt "${#IDS[@]}" ]; do
+      OPTIONS+=("${DISPLAYS[$i]}	${IDS[$i]}")
+      i=$((i + 1))
+    done
+    selected_line="$(printf '%s\n' "${OPTIONS[@]}" | fzf --prompt="$action session> " --height=40% --reverse --delimiter=$'\t' --with-nth=1)"
+    [ -n "$selected_line" ] || exit 0
+    selected_id="${selected_line#*$'\t'}"
+    target_idx=0
+    for sid in "${IDS[@]}"; do
+      if [ "$sid" = "$selected_id" ]; then
+        break
+      fi
+      target_idx=$((target_idx + 1))
+    done
+    printf '%s\n' "$target_idx"
+    return 0
+  fi
+
+  i=1
+  for label in "${DISPLAYS[@]}"; do
+    printf '%2d) %s\n' "$i" "$label"
+    i=$((i + 1))
+  done
+  printf ' 0) Exit\n'
+  printf 'Select session number to %s: ' "$action"
+  read -r idx
+  case "$idx" in
+    ''|*[!0-9]*)
+      echo "Invalid number." >&2
+      exit 1
+      ;;
+  esac
+  if [ "$idx" -eq 0 ]; then
+    exit 0
+  fi
+  if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#IDS[@]}" ]; then
+    echo "Selection out of range." >&2
+    exit 1
+  fi
+  printf '%s\n' "$((idx - 1))"
+}
+
 auto_summary_for_file() {
   file="$1"
   fallback_name="$2"
@@ -214,6 +332,7 @@ fi
 
 IDS=()
 DISPLAYS=()
+SESSION_FILES=()
 for file in "${FILES[@]}"; do
   sid="$(extract_session_id "$file")"
   if [ -z "$sid" ]; then
@@ -239,7 +358,7 @@ for file in "${FILES[@]}"; do
   if [ -z "$summary_text" ]; then
     summary_text="Summary unavailable for this session"
   fi
-  display="$dt   $name_text $sid   [$summary_text]"
+  display="$dt   $name_text [$summary_text] ($sid)"
 
   if [ -n "$FILTER" ]; then
     FILTER_LC="$(printf '%s' "$FILTER" | tr '[:upper:]' '[:lower:]')"
@@ -251,6 +370,7 @@ for file in "${FILES[@]}"; do
 
   IDS+=("$sid")
   DISPLAYS+=("$display")
+  SESSION_FILES+=("$file")
 done
 
 if [ "${#IDS[@]}" -eq 0 ]; then
@@ -263,51 +383,7 @@ if [ "${#IDS[@]}" -eq 0 ]; then
 fi
 
 if [ -n "$SET_NAME" ] || [ -n "$SET_SUMMARY" ]; then
-  if [ "$MODE_LATEST" -eq 1 ] || [ "${#IDS[@]}" -eq 1 ]; then
-    target_idx=0
-  else
-    if command -v fzf >/dev/null 2>&1 && [ -t 0 ] && [ -t 1 ]; then
-      OPTIONS=()
-      i=0
-      while [ "$i" -lt "${#IDS[@]}" ]; do
-        OPTIONS+=("${DISPLAYS[$i]}	${IDS[$i]}")
-        i=$((i + 1))
-      done
-      selected_line="$(printf '%s\n' "${OPTIONS[@]}" | fzf --prompt='update session> ' --height=40% --reverse --delimiter=$'\t' --with-nth=1)"
-      [ -n "$selected_line" ] || exit 0
-      selected_id="${selected_line#*$'\t'}"
-      target_idx=0
-      for sid in "${IDS[@]}"; do
-        if [ "$sid" = "$selected_id" ]; then
-          break
-        fi
-        target_idx=$((target_idx + 1))
-      done
-    else
-      i=1
-      for label in "${DISPLAYS[@]}"; do
-        printf '%2d) %s\n' "$i" "$label"
-        i=$((i + 1))
-      done
-      printf ' 0) Exit\n'
-      printf 'Select session number to update: '
-      read -r idx
-      case "$idx" in
-        ''|*[!0-9]*)
-          echo "Invalid number." >&2
-          exit 1
-          ;;
-      esac
-      if [ "$idx" -eq 0 ]; then
-        exit 0
-      fi
-      if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#IDS[@]}" ]; then
-        echo "Selection out of range." >&2
-        exit 1
-      fi
-      target_idx=$((idx - 1))
-    fi
-  fi
+  target_idx="$(select_target_idx "update")"
   if [ -n "$SET_NAME" ]; then
     save_name_for_id "${IDS[$target_idx]}" "$SET_NAME"
     printf 'Saved session name: %s -> %s\n' "${IDS[$target_idx]}" "$(normalize_name "$SET_NAME")"
@@ -320,6 +396,12 @@ if [ -n "$SET_NAME" ] || [ -n "$SET_SUMMARY" ]; then
       printf 'Saved session summary: %s -> [%s]\n' "${IDS[$target_idx]}" "$(normalize_summary "$SET_SUMMARY")"
     fi
   fi
+  exit 0
+fi
+
+if [ "$MODE_DELETE" -eq 1 ]; then
+  target_idx="$(select_target_idx "delete")"
+  delete_session_by_idx "$target_idx" || exit 0
   exit 0
 fi
 
@@ -344,22 +426,40 @@ else
     i=$((i + 1))
   done
   printf ' 0) Exit\n'
-  printf 'Select session number: '
+  printf 'Select session number (or -N to delete): '
   read -r idx
   case "$idx" in
-    ''|*[!0-9]*)
+    '')
       echo "Invalid number." >&2
       exit 1
       ;;
   esac
-  if [ "$idx" -eq 0 ]; then
-    exit 0
-  fi
-  if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#IDS[@]}" ]; then
-    echo "Selection out of range." >&2
-    exit 1
-  fi
-  SESSION_ID="${IDS[$((idx - 1))]}"
+  case "$idx" in
+    0)
+      exit 0
+      ;;
+    -[0-9]*)
+      delete_num="${idx#-}"
+      if [ -z "$delete_num" ] || [ "$delete_num" -lt 1 ] || [ "$delete_num" -gt "${#IDS[@]}" ]; then
+        echo "Selection out of range." >&2
+        exit 1
+      fi
+      delete_idx=$((delete_num - 1))
+      delete_session_by_idx "$delete_idx" || exit 0
+      exit 0
+      ;;
+    [0-9]*)
+      if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#IDS[@]}" ]; then
+        echo "Selection out of range." >&2
+        exit 1
+      fi
+      SESSION_ID="${IDS[$((idx - 1))]}"
+      ;;
+    *)
+      echo "Invalid number." >&2
+      exit 1
+      ;;
+  esac
 fi
 
 if [ -z "$SESSION_ID" ]; then
